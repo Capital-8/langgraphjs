@@ -42,7 +42,7 @@ async function startQueue() {
   const ops = new FileSystemOps(conn);
   await registerFromEnv(
     ops.assistants,
-    { delay: "./delay.mts:graph" },
+    { delay: "./delay.mts:graph", ask_twice: "./ask_twice.mts:graph" },
     { cwd: fileURLToPath(new URL("./graphs", import.meta.url)) }
   );
   void queue(ops);
@@ -116,4 +116,53 @@ it("picks up later runs after a run's webhook can't be reached", async () => {
     expect.stringContaining("Background worker failed"),
     { run_id: first.run_id }
   );
+});
+
+it("keeps a thread waiting when strict resume refuses an answer", async () => {
+  const { ops, statusOf } = await startQueue();
+  const { thread_id } = await ops.threads.put(
+    uuid7(),
+    { if_exists: "raise" },
+    undefined
+  );
+  const start = async (
+    kwargs: RunKwargs,
+    multitaskStrategy?: "interrupt" | "rollback"
+  ) => {
+    const [run] = await ops.runs.put(
+      uuid7(),
+      getAssistantId("ask_twice"),
+      kwargs,
+      { threadId: thread_id, multitaskStrategy },
+      undefined
+    );
+    return run;
+  };
+
+  const asked = await start({ input: {} });
+  await expect.poll(() => statusOf(asked), { timeout: 5_000 }).toBe("success");
+  const before = await ops.threads.get(thread_id, undefined);
+  expect(before.status).toBe("interrupted");
+
+  const refused = await start({
+    command: { resume: { ["0".repeat(32)]: "x" } },
+  });
+  await expect.poll(() => statusOf(refused), { timeout: 5_000 }).toBe("error");
+  const after = await ops.threads.get(thread_id, undefined);
+  expect([after.status, after.values, after.interrupts]).toEqual([
+    "interrupted",
+    before.values,
+    before.interrupts,
+  ]);
+
+  const resumed = await start(
+    { command: { resume: "yes" } },
+    "interrupt"
+  );
+  await expect
+    .poll(() => statusOf(resumed), { timeout: 5_000 })
+    .toBe("success");
+  expect((await ops.threads.get(thread_id, undefined)).values).toEqual({
+    log: ["a:yes", "b:yes"],
+  });
 });
