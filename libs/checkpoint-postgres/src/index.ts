@@ -21,6 +21,7 @@ import { getMigrations } from "./migrations.js";
 import {
   type SQL_STATEMENTS,
   type SQL_TYPES,
+  MAX_BATCH_ROWS,
   getSQLStatements,
   getTablesWithSchema,
 } from "./sql.js";
@@ -729,6 +730,23 @@ export class PostgresSaver extends BaseCheckpointSaver {
       writes,
       taskPath ?? ""
     );
+    if (
+      query === this.SQL_STATEMENTS.INSERT_CHECKPOINT_WRITES_SQL &&
+      dumpedWrites.length <= MAX_BATCH_ROWS
+    ) {
+      // One statement is atomic alone, so this skips BEGIN and COMMIT and a
+      // round trip per row.
+      await this.pool.query(
+        this.SQL_STATEMENTS.INSERT_CHECKPOINT_WRITES_BATCH_SQL(
+          dumpedWrites.length
+        ),
+        [
+          ...dumpedWrites[0].slice(0, 5),
+          ...dumpedWrites.flatMap((w) => w.slice(5)),
+        ]
+      );
+      return;
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
