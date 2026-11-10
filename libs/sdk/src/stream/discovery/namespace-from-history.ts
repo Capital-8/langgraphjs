@@ -22,9 +22,12 @@ import type {
   Metadata,
   ThreadState,
 } from "../../schema.js";
-import { NAMESPACE_SEPARATOR, DEFAULT_MESSAGES_KEY } from "../constants.js";
-import { namespaceKey } from "../namespace.js";
-import { normalizeAIMessageToolCalls } from "../message-coercion.js";
+import {
+  NAMESPACE_SEPARATOR,
+  DEFAULT_MESSAGES_KEY,
+} from "../../ui/constants.js";
+import { namespaceKey } from "../../ui/namespace.js";
+import { normalizeAIMessageToolCalls } from "../../ui/message-coercion.js";
 
 type AnyCheckpoint = ThreadState<Record<string, unknown>>;
 
