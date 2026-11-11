@@ -41,6 +41,12 @@ import {
   prepareOptimisticInput,
   serializeUpdateMessages,
 } from "./optimistic-input.js";
+import {
+  MessageMetadataTracker,
+  findForkPoints,
+  type MessageMetadataMap,
+} from "./message-metadata-tracker.js";
+import type { StreamStore } from "./store.js";
 import { flushPendingHeadlessToolInterrupts } from "../headless-tools.js";
 import type {
   UseStreamThread,
@@ -334,6 +340,18 @@ export class StreamOrchestrator<
 
   #handledHeadlessToolInterruptIds = new Set<string>();
 
+  readonly #metadata = new MessageMetadataTracker();
+
+  #metadataUsers = 0;
+
+  /** Messages a read-back placed or gave up on, so none is read for twice. */
+  #forkDecided = new Set<string>();
+
+  /** Checkpoints a read-back read the steps of, where the next one stops. */
+  readonly #forkSeen = new Set<string>();
+
+  #forkRead: AbortController | undefined;
+
   /**
    * Create a new StreamOrchestrator.
    *
@@ -424,6 +442,7 @@ export class StreamOrchestrator<
    */
   #notify(): void {
     if (this.#disposed) return;
+    this.#placeForkPoints();
     this.#version += 1;
     for (const listener of this.#listeners) {
       listener();
@@ -470,6 +489,11 @@ export class StreamOrchestrator<
     this.#handledHeadlessToolInterruptIds.clear();
     this.#answered.clear();
     this.#interruptNamespaces.clear();
+    this.#metadata.reset();
+    this.#forkRead?.abort();
+    this.#forkRead = undefined;
+    this.#forkDecided.clear();
+    this.#forkSeen.clear();
     this.stream.clear();
   }
 
@@ -919,6 +943,87 @@ export class StreamOrchestrator<
   }
 
   /**
+   * Each shown message's `parentCheckpointId`, the checkpoint to fork from to
+   * edit it, while {@link trackMessageMetadata} holds, and each optimistic
+   * message's `optimisticStatus`.
+   */
+  get messageMetadataStore(): StreamStore<MessageMetadataMap> {
+    return this.#metadata.store;
+  }
+
+  /**
+   * Places fork points in {@link messageMetadataStore} until the returned
+   * release is called, as a `useMessageMetadata` hook does while mounted.
+   * Whenever the engine is idle with messages not placed yet, it reads the
+   * thread's history from the newest checkpoint down to one it read before.
+   */
+  trackMessageMetadata(): () => void {
+    this.#metadataUsers += 1;
+    this.#placeForkPoints();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#metadataUsers -= 1;
+    };
+  }
+
+  #placeForkPoints(): void {
+    const threadId = this.#threadId;
+    if (
+      this.#metadataUsers === 0 ||
+      this.#disposed ||
+      this.#forkRead != null ||
+      threadId == null ||
+      this.isLoading ||
+      this.#history.isLoading
+    ) {
+      return;
+    }
+    const targets = new Set(
+      this.messages.flatMap(({ id }) =>
+        id != null && !this.#forkDecided.has(id) ? [id] : []
+      )
+    );
+    if (targets.size === 0) return;
+
+    const client = this.#accessors.getClient();
+    const read = new AbortController();
+    this.#forkRead = read;
+    void findForkPoints(
+      ({ before, checkpoint, ...options }) =>
+        client.threads.getHistory(threadId, {
+          ...options,
+          signal: read.signal,
+          before:
+            before == null
+              ? undefined
+              : { configurable: { checkpoint_id: before } },
+          checkpoint:
+            checkpoint == null ? undefined : { checkpoint_id: checkpoint },
+        }),
+      this.#accessors.getMessagesKey(),
+      targets,
+      this.#forkSeen
+    ).then(
+      ({ forkPoints, visited }) => {
+        // A thread switch dropped the read.
+        if (this.#forkRead !== read) return;
+        this.#forkRead = undefined;
+        for (const id of targets) this.#forkDecided.add(id);
+        for (const id of visited) this.#forkSeen.add(id);
+        this.#metadata.recordForkPoints(forkPoints);
+        // Messages may have come while it read.
+        this.#placeForkPoints();
+      },
+      () => {
+        // A failed read waits for the next change instead of retrying at once.
+        if (this.#forkRead === read) this.#forkRead = undefined;
+      }
+    );
+  }
+
+  /**
    * The list of pending run entries currently waiting in the queue.
    */
   get queueEntries() {
@@ -1347,18 +1452,14 @@ export class StreamOrchestrator<
     this.#ownRun = ownRun;
     const watch: RunWatch = {};
     let outcome: RunOutcome = "aborted";
+    const input = this.#prepareInput(values);
     const optimistic =
       this.#options.optimistic !== false &&
-      submitOptions?.optimisticValues == null &&
-      values != null &&
-      typeof values === "object" &&
-      !Array.isArray(values)
-        ? prepareOptimisticInput(
-            values,
-            this.#accessors.getMessagesKey(),
-            uuidv7
-          )
+      submitOptions?.optimisticValues == null
+        ? input
         : undefined;
+    const unsent = new Set(optimistic?.echoedIds);
+    if (unsent.size > 0) this.#metadata.markPending(unsent);
     const stopRun = new AbortController();
 
     const started = this.stream.start(
@@ -1428,10 +1529,7 @@ export class StreamOrchestrator<
         else signal.addEventListener("abort", closeRequest, { once: true });
 
         return client.runs.stream(usableThreadId!, assistantId, {
-          input: (optimistic?.dispatchInput ?? values) as Record<
-            string,
-            unknown
-          >,
+          input: (input?.dispatchInput ?? values) as Record<string, unknown>,
           config: withV1Streaming(
             submitOptions?.config,
             submitOptions?.context
@@ -1506,6 +1604,12 @@ export class StreamOrchestrator<
           this.#threadIdStreaming = null;
           settleOwnRun();
           this.#unhide(submitOptions?.command);
+          // A run that ends before its values hold a message almost always
+          // ended before saving its input.
+          this.#metadata.resolvePending(
+            unsent,
+            outcome === "success" ? "sent" : "failed"
+          );
           if (this.#stopOwnRun === stopRun) this.#stopOwnRun = undefined;
           if (runId == null) return;
           if (this.#streamingRunId === runId) this.#streamingRunId = undefined;
@@ -1517,6 +1621,12 @@ export class StreamOrchestrator<
           responded = true;
           settleOwnRun();
           this.#watchEvent(watch, event, data);
+          if (event === "values" && unsent.size > 0) {
+            const saved = this.#getMessages((data ?? {}) as StateType).flatMap(
+              ({ id }) => (id != null && unsent.delete(id) ? [id] : [])
+            );
+            this.#metadata.resolvePending(saved, "sent");
+          }
         },
       },
       {
@@ -1532,6 +1642,26 @@ export class StreamOrchestrator<
         this.#liveRuns.delete(runId);
       }
     });
+  }
+
+  /**
+   * The input with an id on every message, also when it isn't shown at once,
+   * since the fork points are found by the ids the run's steps wrote.
+   */
+  #prepareInput(values: StateType | null | undefined) {
+    if (values == null || typeof values !== "object" || Array.isArray(values)) {
+      return undefined;
+    }
+    try {
+      return prepareOptimisticInput(
+        values,
+        this.#accessors.getMessagesKey(),
+        uuidv7
+      );
+    } catch {
+      // Messages the client can't read go as they are, for the server to judge.
+      return undefined;
+    }
   }
 
   #getRunStreamModes(
@@ -1630,7 +1760,8 @@ export class StreamOrchestrator<
           // run first.
           if (this.#ownRun) await this.#ownRun;
           const run = await client.runs.create(usableThreadId, assistantId, {
-            input: values as Record<string, unknown>,
+            input: (this.#prepareInput(values)?.dispatchInput ??
+              values) as Record<string, unknown>,
             config: withV1Streaming(
               submitOptions?.config,
               submitOptions?.context
@@ -1840,7 +1971,14 @@ export class StreamOrchestrator<
     } else if (threadId != null) {
       this.#hydration = this.#mutate(threadId).then((states) => {
         if (states == null || threadId !== this.#threadId) return;
-        if (!this.isLoading) this.stream.setStreamValues(null);
+        if (!this.isLoading) {
+          // A failed message the reload still shows was saved after all, so
+          // its fork point is read again.
+          const unsaved = this.#metadata.unpersistedOptimisticIds();
+          this.#metadata.forget(unsaved);
+          for (const id of unsaved) this.#forkDecided.delete(id);
+          this.stream.setStreamValues(null);
+        }
         return this.#joinActiveRun(threadId, states);
       });
     }

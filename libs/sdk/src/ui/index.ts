@@ -55,3 +55,7 @@ export {
   type StreamOrchestratorOptions,
 } from "./orchestrator.js";
 export { CustomStreamOrchestrator } from "./orchestrator-custom.js";
+export type {
+  MessageMetadataMap,
+  OptimisticStatus,
+} from "./message-metadata-tracker.js";
